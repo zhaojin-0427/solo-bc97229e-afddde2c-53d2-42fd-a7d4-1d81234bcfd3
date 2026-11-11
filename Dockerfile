@@ -10,8 +10,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /data \
+    && chown -R appuser /app /data
 USER appuser
+
+VOLUME ["/data"]
 
 EXPOSE 8000
 

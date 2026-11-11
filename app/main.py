@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import solver
+from . import db, solver
+from .ingest import IngestError
+from .ingest_api import router as ingest_router
 from .schemas import (
     ErrorResponse,
     InvalidRecordInfo,
@@ -19,7 +22,10 @@ from .schemas import (
 )
 
 DESCRIPTION = """
-Normalize carrier-exported local scan times to UTC under IANA timezone rules.
+Normalize carrier-exported local scan times to UTC under IANA timezone rules,
+and ingest carrier scan logs over resumable, chunked uploads.
+
+## `/normalize` — 扫描时间归一化
 
 * Each record's local time yields **0, 1 or 2 legal UTC candidates**
   (DST fall-back duplicates a local time; spring-forward makes one nonexistent).
@@ -32,6 +38,18 @@ Normalize carrier-exported local scan times to UTC under IANA timezone rules.
 * If any record has no legal candidate, or the links are mutually inconsistent,
   the request fails with **HTTP 409** and a precise reason — no partial
   conversion is ever returned.
+
+## 断点入库 — 承运商断网补传 NDJSON
+
+1. `POST /uploads` 创建会话，固定文件总字节数与 SHA-256；
+2. `PUT /uploads/{upload_id}/chunks` 按字节偏移分片，可乱序、可跨行；
+   重叠字节相同可重传，不同则整片拒绝且已收内容不变；
+3. `GET /uploads/{upload_id}/missing` 查询缺失字节区间，重启后进度一致；
+4. `POST /uploads/{upload_id}/complete` 核对无空洞、摘要与全部记录，
+   通过后整批记录**原子写入 SQLite**；失败不暴露任何部分记录；
+5. `GET /batches/{batch_id}/records` 按原行序分页供归一化作业取数。
+
+完成/重试并发下只会入库一次并返回同一批次；完成后分片不可修改。
 """
 
 DEMO_DST_FALLBACK = {
@@ -67,11 +85,34 @@ DEMO_CONFLICTING_LINKS = {
     ],
 }
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Create/verify the SQLite schema before serving; WAL keeps readers working
+    # while chunk writers and completion transactions take the write lock.
+    db.init_db()
+    yield
+
+
 app = FastAPI(
     title="Scan Time Normalizer",
     description=DESCRIPTION,
     version="1.0.0",
+    lifespan=lifespan,
 )
+
+app.include_router(ingest_router)
+
+
+@app.exception_handler(IngestError)
+async def ingest_error_handler(_: Request, exc: IngestError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.error,
+            "message": exc.message,
+            "details": exc.details,
+        },
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -80,6 +121,10 @@ def root() -> dict:
         "service": "scan-time-normalizer",
         "docs": "/docs",
         "normalize": "POST /normalize",
+        "uploads": "POST /uploads",
+        "missing_ranges": "GET /uploads/{upload_id}/missing",
+        "complete": "POST /uploads/{upload_id}/complete",
+        "batches": "GET /batches",
         "health": "/healthz",
     }
 
